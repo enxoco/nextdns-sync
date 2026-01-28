@@ -141,10 +141,34 @@ func syncLogs(config *Config, db *sql.DB) error {
 
 	if streamID != "" {
 		log.Printf("Attempting to use stream API with stream ID: %s", streamID)
-		err := streamLogs(ctx, config, db, streamID)
-		if err != nil {
-			log.Printf("Stream API failed: %v, falling back to pagination", err)
-		} else {
+
+		// Keep trying to stream with exponential backoff
+		retryDelay := 1 * time.Second
+		maxRetryDelay := 60 * time.Second
+
+		for {
+			err := streamLogs(ctx, config, db, streamID)
+			if err != nil {
+				log.Printf("Stream disconnected: %v", err)
+				log.Printf("Reconnecting in %v...", retryDelay)
+				time.Sleep(retryDelay)
+
+				// Exponential backoff
+				retryDelay *= 2
+				if retryDelay > maxRetryDelay {
+					retryDelay = maxRetryDelay
+				}
+
+				// Get the latest stream ID before reconnecting
+				streamID, err = getStreamCursor(db)
+				if err != nil {
+					log.Printf("Warning: could not get stream ID: %v", err)
+				}
+
+				continue
+			}
+
+			// If stream ended cleanly, exit
 			return nil
 		}
 	} else {
@@ -182,9 +206,31 @@ func streamLogs(ctx context.Context, config *Config, db *sql.DB, streamID string
 	count := 0
 	currentStreamID := streamID
 	var lastEventID string
+	lineCount := 0
+	lastActivity := time.Now()
+
+	// Start a heartbeat goroutine to show we're still alive
+	done := make(chan bool)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				elapsed := time.Since(lastActivity)
+				log.Printf("Stream alive: %d lines, %d logs processed (last activity: %v ago)", lineCount, count, elapsed.Round(time.Second))
+			case <-done:
+				return
+			}
+		}
+	}()
+	defer close(done)
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		lineCount++
+		lastActivity = time.Now()
+
 		if line == "" {
 			continue
 		}
@@ -192,6 +238,7 @@ func streamLogs(ctx context.Context, config *Config, db *sql.DB, streamID string
 		// Parse SSE format: "id: ..." or "data: ..."
 		if strings.HasPrefix(line, "id: ") {
 			lastEventID = strings.TrimPrefix(line, "id: ")
+			log.Printf("Received event ID: %s", lastEventID)
 			continue
 		}
 
@@ -207,22 +254,26 @@ func streamLogs(ctx context.Context, config *Config, db *sql.DB, streamID string
 			logEntry.GenerateID() // Generate ID for streamed entry
 
 			if err := insertLog(db, &logEntry); err != nil {
-				if err != sql.ErrNoRows {
+				if err == sql.ErrNoRows {
+					log.Printf("Duplicate log entry (domain: %s)", logEntry.Domain)
+				} else {
 					log.Printf("Failed to insert log: %v", err)
 				}
 				continue
 			}
 
 			count++
-			if count%100 == 0 {
-				log.Printf("Synced %d logs via stream", count)
-			}
+			log.Printf("✓ Inserted log #%d: %s -> %s", count, logEntry.Domain, logEntry.Status)
 
-			// Update stream ID periodically with the last event ID we received
-			if count%1000 == 0 && lastEventID != "" {
+			// Update stream ID with the last event ID we received
+			if lastEventID != "" {
 				currentStreamID = lastEventID
-				if err := updateStreamCursor(db, currentStreamID); err != nil {
-					log.Printf("Warning: failed to update stream ID: %v", err)
+				if count%100 == 0 {
+					if err := updateStreamCursor(db, currentStreamID); err != nil {
+						log.Printf("Warning: failed to update stream ID: %v", err)
+					} else {
+						log.Printf("Updated stream cursor to: %s", currentStreamID)
+					}
 				}
 			}
 		}
@@ -230,6 +281,7 @@ func streamLogs(ctx context.Context, config *Config, db *sql.DB, streamID string
 
 	// Save the last event ID before exiting
 	if lastEventID != "" {
+		log.Printf("Saving final stream cursor: %s", lastEventID)
 		if err := updateStreamCursor(db, lastEventID); err != nil {
 			log.Printf("Warning: failed to update stream ID: %v", err)
 		}
@@ -239,6 +291,7 @@ func streamLogs(ctx context.Context, config *Config, db *sql.DB, streamID string
 		return fmt.Errorf("stream error: %v", err)
 	}
 
+	log.Printf("Stream ended cleanly after processing %d logs", count)
 	return nil
 }
 
@@ -390,4 +443,11 @@ func updateStreamCursor(db *sql.DB, cursor string) error {
 	`
 	_, err := db.Exec(query, cursor)
 	return err
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

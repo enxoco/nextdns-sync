@@ -1,0 +1,22 @@
+name: nextdns
+services:
+  sync:
+    image: nextdns-sync
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=nextdns
+    healthcheck:
+      test: pg_isready -U postgres -d nextdns
+      interval: 1m30s
+      timeout: 30s
+      retries: 5
+      start_period: 30s

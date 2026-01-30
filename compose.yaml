@@ -20,3 +20,7 @@ services:
       timeout: 30s
       retries: 5
       start_period: 30s
+  grafana:
+    image: grafana/grafana-enterprise
+    ports:
+      - 3333:3000

@@ -5,7 +5,7 @@ RUN go mod download
 COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /nextdns-sync
 RUN apt update && apt install -y ca-certificates
-RUN ls -lah /etc/ssl
+
 
 FROM scratch
 COPY --from=base /nextdns-sync /nextdns-sync
